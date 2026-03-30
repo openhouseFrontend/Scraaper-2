@@ -22,6 +22,7 @@ from .config import ScraperConfig, USER_AGENTS
 _UC_INIT_LOCK = threading.Lock()
 _CHROME_VERSION_LOCK = threading.Lock()
 _CACHED_CHROME_MAJOR_VERSION: int | None = None
+_UC_DEL_PATCHED = False
 
 
 def _install_distutils_shim() -> None:
@@ -81,15 +82,35 @@ def _install_distutils_shim() -> None:
 
 
 def _load_uc():
+    global _UC_DEL_PATCHED
     try:
         import undetected_chromedriver as uc  # type: ignore
-        return uc
     except ModuleNotFoundError as exc:
         if exc.name != "distutils":
             raise
         _install_distutils_shim()
         import undetected_chromedriver as uc  # type: ignore
-        return uc
+    if not _UC_DEL_PATCHED:
+        _patch_uc_del(uc)
+        _UC_DEL_PATCHED = True
+    return uc
+
+
+def _patch_uc_del(uc_module) -> None:
+    original_del = getattr(uc_module.Chrome, "__del__", None)
+    if original_del is None:
+        return
+
+    def _safe_del(self) -> None:  # noqa: ANN001
+        try:
+            original_del(self)
+        except OSError:
+            # Known undetected-chromedriver cleanup race on Windows handles.
+            return
+        except Exception:  # noqa: BLE001
+            return
+
+    uc_module.Chrome.__del__ = _safe_del
 
 
 class BrowserManager:
