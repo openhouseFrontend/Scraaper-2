@@ -61,7 +61,8 @@ class ListingParser:
         record.website = self._attribute_from_xpaths(
             [
                 "//a[@data-item-id='authority']",
-                "//a[@data-item-id='authority']/@href",
+                "//a[contains(@aria-label, 'Website')]",
+                "//a[contains(@data-item-id, 'authority')]",
             ],
             "href",
         )

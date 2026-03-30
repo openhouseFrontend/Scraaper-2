@@ -50,12 +50,19 @@ class DataPipeline:
         df["website"] = df["website"].map(self.normalize_website)
         df["business_name"] = df["business_name"].astype(str).str.strip()
         df["query_source"] = df["query_source"].astype(str).str.strip()
+        df["address"] = df["address"].astype(str).str.strip()
 
-        df["_dedupe_key"] = (
-            df["business_name"].str.lower().str.replace(r"\s+", " ", regex=True)
+        name_key = df["business_name"].str.lower().str.replace(r"\s+", " ", regex=True)
+        phone_key = df["phone"].astype(str).str.strip()
+        place_key = df["google_maps_url"].map(self.extract_place_key)
+        fallback_key = (
+            name_key
             + "||"
-            + df["phone"].astype(str).str.strip()
+            + df["address"].str.lower().str.replace(r"\s+", " ", regex=True)
+            + "||"
+            + place_key
         )
+        df["_dedupe_key"] = (name_key + "||" + phone_key).where(phone_key != "", fallback_key)
         df = df.drop_duplicates(subset=["_dedupe_key"], keep="first").drop(columns=["_dedupe_key"])
         return df
 
@@ -94,10 +101,28 @@ class DataPipeline:
         url = str(raw_url or "").strip()
         if not url:
             return ""
+        lowered = url.lower()
+        blocked = ("support.google.com", "google.com/contributionpolicy", "google.com/maps")
+        if any(item in lowered for item in blocked):
+            return ""
         if not url.startswith(("http://", "https://")):
             url = f"https://{url}"
         parsed = urlparse(url)
         if not parsed.netloc:
             return ""
         return f"{parsed.scheme}://{parsed.netloc}{parsed.path or ''}"
+
+    @staticmethod
+    def extract_place_key(url: str) -> str:
+        value = str(url or "")
+        if not value:
+            return ""
+        match = re.search(r"!1s([^!]+)", value)
+        if match:
+            return match.group(1)
+        # Fallback to path tail before /data
+        match = re.search(r"/maps/place/([^/]+)/data", value)
+        if match:
+            return match.group(1)
+        return value.strip().lower()
 
