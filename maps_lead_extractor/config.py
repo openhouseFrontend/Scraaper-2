@@ -42,5 +42,8 @@ class ScraperConfig:
     min_sleep_sec: float = 0.75
     max_sleep_sec: float = 1.75
     max_workers: int = 3
+    listing_retry_count: int = 2
+    query_bootstrap_retries: int = 2
+    rotate_driver_every: int = 35
     output_dir: Path = Path("output")
 
