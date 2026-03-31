@@ -75,8 +75,12 @@ class ListingParser:
             ]
             )
         )
-        record.hours = self._extract_hours()
-        record.services = self._extract_services()
+        if not self.config.fast_mode:
+            record.hours = self._extract_hours()
+            record.services = self._extract_services()
+        else:
+            record.hours = ""
+            record.services = ""
         record.category = self._normalize_category(record.category)
         record.locality, record.city = self._split_address(record.address)
         return record

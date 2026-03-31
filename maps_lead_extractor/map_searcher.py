@@ -36,7 +36,10 @@ class MapSearcher:
             if "/maps/place/" in current_url:
                 return [current_url.split("&", 1)[0]]
             return []
-        return self._scroll_results_until_end()
+        urls = self._scroll_results_until_end()
+        if self.config.max_listings_per_query > 0:
+            return urls[: self.config.max_listings_per_query]
+        return urls
 
     def _search_with_input(self, query: str) -> None:
         try:
@@ -85,10 +88,12 @@ class MapSearcher:
                 feed.send_keys(Keys.END)
             except Exception:  # noqa: BLE001
                 pass
-            time.sleep(random.uniform(1.1, 2.0))
+            time.sleep(random.uniform(self.config.scroll_sleep_min_sec, self.config.scroll_sleep_max_sec))
 
             page_text = self.driver.page_source.lower()
             if "you've reached the end of the list" in page_text or "end of results" in page_text:
+                break
+            if self.config.max_listings_per_query > 0 and len(discovered_urls) >= self.config.max_listings_per_query:
                 break
 
         return sorted(discovered_urls)

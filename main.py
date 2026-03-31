@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
+import json
 import logging
+import threading
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Iterable
@@ -24,6 +28,107 @@ logger = logging.getLogger("gmaps_lead_extractor")
 console = Console()
 
 
+class CheckpointManager:
+    def __init__(self, output_dir: Path, queries: list[str], fresh_run: bool = False) -> None:
+        self._lock = threading.Lock()
+        self.queries = queries
+        joined = "\n".join(q.strip() for q in queries if q.strip())
+        self.fingerprint = hashlib.sha256(joined.encode("utf-8")).hexdigest()[:16]
+        self.root = output_dir / "checkpoints" / self.fingerprint
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.state_path = self.root / "state.json"
+        self.records_path = self.root / "records.jsonl"
+        self.snapshot_csv = self.root / "snapshot.csv"
+        self.snapshot_json = self.root / "snapshot.json"
+        self.state = self._load_state(fresh_run=fresh_run)
+
+    def _load_state(self, fresh_run: bool) -> dict:
+        if fresh_run:
+            if self.records_path.exists():
+                self.records_path.unlink()
+            state = self._new_state()
+            self._write_state(state)
+            return state
+
+        if self.state_path.exists():
+            try:
+                raw = json.loads(self.state_path.read_text(encoding="utf-8"))
+                if raw.get("fingerprint") == self.fingerprint:
+                    raw.setdefault("completed_queries", [])
+                    raw.setdefault("failed_queries", {})
+                    return raw
+            except Exception:  # noqa: BLE001
+                pass
+
+        state = self._new_state()
+        self._write_state(state)
+        return state
+
+    def _new_state(self) -> dict:
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        return {
+            "fingerprint": self.fingerprint,
+            "created_at": now,
+            "updated_at": now,
+            "total_queries": len(self.queries),
+            "completed_queries": [],
+            "failed_queries": {},
+        }
+
+    def _write_state(self, state: dict) -> None:
+        state["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        self.state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def pending_queries(self) -> list[str]:
+        done = set(self.state.get("completed_queries", []))
+        return [q for q in self.queries if q not in done]
+
+    def mark_query_completed(self, query: str) -> None:
+        with self._lock:
+            completed = set(self.state.get("completed_queries", []))
+            if query not in completed:
+                self.state["completed_queries"].append(query)
+                self._write_state(self.state)
+
+    def mark_query_failed(self, query: str, error: Exception) -> None:
+        with self._lock:
+            failed = self.state.setdefault("failed_queries", {})
+            failed[query] = str(error)
+            self._write_state(self.state)
+
+    def append_record(self, record: LeadRecord) -> None:
+        payload = record.to_dict()
+        with self._lock:
+            with self.records_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    def load_records(self) -> list[LeadRecord]:
+        if not self.records_path.exists():
+            return []
+        records: list[LeadRecord] = []
+        with self.records_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    payload = json.loads(raw)
+                    records.append(LeadRecord(**payload))
+                except Exception:  # noqa: BLE001
+                    continue
+        return records
+
+    def write_snapshot(self, pipeline: DataPipeline) -> tuple[int, int]:
+        records = self.load_records()
+        frame = pipeline.to_dataframe(records)
+        frame.to_csv(self.snapshot_csv, index=False, encoding="utf-8-sig")
+        self.snapshot_json.write_text(
+            json.dumps(frame.to_dict(orient="records"), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return len(records), len(frame)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Production-grade Google Maps Lead Extractor (Pure Python + Selenium)."
@@ -31,6 +136,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--queries", nargs="+", help="One or more search queries.")
     parser.add_argument("--query-file", type=Path, help="Path to query text file (one query per line).")
     parser.add_argument("--max-workers", type=int, default=3, help="Parallel query workers.")
+    parser.add_argument("--timeout-sec", type=int, default=20, help="Selenium wait timeout in seconds.")
     parser.add_argument("--headless", action="store_true", help="Run Chrome in headless mode.")
     parser.add_argument("--output-dir", type=Path, default=Path("output"), help="Output directory.")
     parser.add_argument(
@@ -50,6 +156,28 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=35,
         help="Recreate browser after N parsed listings to reduce stale sessions.",
+    )
+    parser.add_argument(
+        "--max-listings-per-query",
+        type=int,
+        default=0,
+        help="Hard cap listings per query (0 = no cap).",
+    )
+    parser.add_argument(
+        "--snapshot-every",
+        type=int,
+        default=5,
+        help="Write checkpoint snapshot every N completed queries.",
+    )
+    parser.add_argument(
+        "--fast-mode",
+        action="store_true",
+        help="Faster scrape: shorter sleeps, optional field skips, and quicker rotations.",
+    )
+    parser.add_argument(
+        "--fresh-run",
+        action="store_true",
+        help="Ignore previous checkpoint for the same query set and start fresh.",
     )
     parser.add_argument("--log-level", default="INFO", help="DEBUG, INFO, WARNING, ERROR")
     return parser.parse_args()
@@ -118,7 +246,7 @@ def _safe_quit(driver) -> None:
         pass
 
 
-def scrape_single_query(query: str, config: ScraperConfig) -> list[LeadRecord]:
+def scrape_single_query(query: str, config: ScraperConfig, checkpoint: CheckpointManager | None = None) -> list[LeadRecord]:
     logger.info("Starting query: %s", query)
     browser_manager = BrowserManager(config)
     records: list[LeadRecord] = []
@@ -163,6 +291,8 @@ def scrape_single_query(query: str, config: ScraperConfig) -> list[LeadRecord]:
                 try:
                     record = parser.parse_listing(url, query=query)
                     records.append(record)
+                    if checkpoint is not None:
+                        checkpoint.append_record(record)
                     parsed_since_rotation += 1
                     listing_completed = True
                     break
@@ -198,7 +328,13 @@ def scrape_single_query(query: str, config: ScraperConfig) -> list[LeadRecord]:
     return records
 
 
-async def scrape_queries_parallel(queries: Iterable[str], config: ScraperConfig) -> list[LeadRecord]:
+async def scrape_queries_parallel(
+    queries: Iterable[str],
+    config: ScraperConfig,
+    checkpoint: CheckpointManager,
+    pipeline: DataPipeline,
+    snapshot_every: int = 5,
+) -> list[LeadRecord]:
     query_list = list(queries)
     all_records: list[LeadRecord] = []
     failed_queries: list[str] = []
@@ -206,7 +342,7 @@ async def scrape_queries_parallel(queries: Iterable[str], config: ScraperConfig)
     async def run_query(query: str, pool: ThreadPoolExecutor) -> tuple[str, list[LeadRecord], Exception | None]:
         loop = asyncio.get_running_loop()
         try:
-            records = await loop.run_in_executor(pool, scrape_single_query, query, config)
+            records = await loop.run_in_executor(pool, scrape_single_query, query, config, checkpoint)
             return query, records, None
         except Exception as exc:  # noqa: BLE001
             return query, [], exc
@@ -222,14 +358,27 @@ async def scrape_queries_parallel(queries: Iterable[str], config: ScraperConfig)
 
     with progress:
         task_id = progress.add_task("Running queries", total=len(query_list))
+        completed_count = 0
         with ThreadPoolExecutor(max_workers=config.max_workers) as pool:
             tasks = [asyncio.create_task(run_query(query, pool)) for query in query_list]
             for task in asyncio.as_completed(tasks):
                 query, records, error = await task
                 if error is None:
                     all_records.extend(records)
+                    checkpoint.mark_query_completed(query)
+                    completed_count += 1
+                    if snapshot_every <= 1 or completed_count % snapshot_every == 0:
+                        raw, clean = checkpoint.write_snapshot(pipeline)
+                        logger.info(
+                            "Checkpoint snapshot: completed=%d/%d raw=%d clean=%d",
+                            len(checkpoint.state.get("completed_queries", [])),
+                            len(query_list),
+                            raw,
+                            clean,
+                        )
                 else:
                     failed_queries.append(query)
+                    checkpoint.mark_query_failed(query, error)
                     logger.error("Query failed: '%s' :: %s", query, error)
                 progress.advance(task_id, 1)
 
@@ -263,23 +412,66 @@ async def async_main() -> int:
     if not queries:
         raise RuntimeError("No valid queries available.")
 
+    min_sleep = 0.75
+    max_sleep = 1.75
+    scroll_min = 1.1
+    scroll_max = 2.0
+    rotate_every = max(0, args.rotate_driver_every)
+    listing_retry_count = max(0, args.listing_retry_count)
+    query_bootstrap_retries = max(0, args.query_bootstrap_retries)
+    if args.fast_mode:
+        min_sleep = 0.2
+        max_sleep = 0.7
+        scroll_min = 0.35
+        scroll_max = 0.9
+        if rotate_every <= 0:
+            rotate_every = 25
+        listing_retry_count = min(listing_retry_count, 1)
+        query_bootstrap_retries = min(query_bootstrap_retries, 1)
+
     config = ScraperConfig(
         headless=args.headless,
+        timeout_sec=max(5, args.timeout_sec),
+        min_sleep_sec=min_sleep,
+        max_sleep_sec=max_sleep,
+        scroll_sleep_min_sec=scroll_min,
+        scroll_sleep_max_sec=scroll_max,
         max_workers=max(1, args.max_workers),
-        listing_retry_count=max(0, args.listing_retry_count),
-        query_bootstrap_retries=max(0, args.query_bootstrap_retries),
-        rotate_driver_every=max(0, args.rotate_driver_every),
+        listing_retry_count=listing_retry_count,
+        query_bootstrap_retries=query_bootstrap_retries,
+        rotate_driver_every=rotate_every,
+        max_listings_per_query=max(0, args.max_listings_per_query),
+        fast_mode=args.fast_mode,
         output_dir=args.output_dir,
     )
     pipeline = DataPipeline(output_dir=config.output_dir)
+    checkpoint = CheckpointManager(
+        output_dir=config.output_dir,
+        queries=queries,
+        fresh_run=args.fresh_run,
+    )
+
+    pending_queries = checkpoint.pending_queries()
 
     console.print(f"[bold]Queries loaded:[/bold] {len(queries)}")
-    for q in queries:
+    console.print(f"[bold]Pending queries:[/bold] {len(pending_queries)}")
+    console.print(f"[bold]Checkpoint:[/bold] {checkpoint.root}")
+    for q in pending_queries:
         console.print(f" - {q}")
 
-    records = await scrape_queries_parallel(queries=queries, config=config)
+    if pending_queries:
+        await scrape_queries_parallel(
+            queries=pending_queries,
+            config=config,
+            checkpoint=checkpoint,
+            pipeline=pipeline,
+            snapshot_every=max(1, args.snapshot_every),
+        )
+
+    records = checkpoint.load_records()
     dataframe = pipeline.to_dataframe(records)
     csv_path, json_path = pipeline.export(dataframe)
+    checkpoint.write_snapshot(pipeline)
     print_results_table(len(records), len(dataframe), csv_path, json_path)
     return 0
 
